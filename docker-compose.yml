@@ -1,0 +1,51 @@
+version: "3.8"
+
+services:
+  # 1. The Relational Database (For Next.js / User Auth / Project Metadata)
+  postgres:
+    image: postgres:15-alpine
+    container_name: claude-clone-postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: securepassword
+      POSTGRES_DB: claudedb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # 2. The Vector Database (For the Agent's Semantic Memory)
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: claude-clone-vector
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    restart: unless-stopped
+  version: '3.8'
+
+
+  # 3. The Graph Database (For the Agent's Structural Architecture Memory)
+  neo4j:
+    image: neo4j:5
+    container_name: claude-clone-graph
+    environment:
+      - NEO4J_AUTH=neo4j/securepassword  # The default username is neo4j
+    ports:
+      - "7474:7474" # Browser UI
+      - "7687:7687" # Bolt protocol (How our Node app talks to it)
+    volumes:
+      - neo4j_data:/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  chroma_data:
+  neo4j_data: # Don't forget to add the volume here!
+
+
