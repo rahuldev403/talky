@@ -17,6 +17,7 @@ import * as path from "path";
 import { exec } from "child_process";
 import { promisify } from "util";
 import { saveToMemory, searchMemory } from "./memory";
+import { mapDependency, analyzeImpact } from "./graph";
 
 const execAsync = promisify(exec);
 
@@ -39,7 +40,6 @@ const AgentState = Annotation.Root({
 const executeCodeTool = tool(
   async ({ code, language, objective }) => {
     console.log(`\n[SYSTEM] Spinning up Docker to run ${language} code...`);
-
     const tmpDir = path.join(process.cwd(), "tmp_sandbox");
     if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
 
@@ -55,9 +55,7 @@ const executeCodeTool = tool(
       fileName = "script.js";
       dockerImage = "node:18-alpine";
       runCmd = "node script.js";
-    } else {
-      return `Error: Unsupported language.`;
-    }
+    } else return `Error: Unsupported language.`;
 
     const filePath = path.join(tmpDir, fileName);
     fs.writeFileSync(filePath, code);
@@ -67,7 +65,6 @@ const executeCodeTool = tool(
         `docker run --rm --network none -v "${tmpDir}:/app" -w /app ${dockerImage} ${runCmd}`,
         { timeout: 10000 },
       );
-
       await saveToMemory(code, language, objective || "Execution test");
       return `Execution Output:\n${stdout}\n${stderr ? "Warnings:\n" + stderr : ""}`;
     } catch (error: any) {
@@ -87,17 +84,30 @@ const executeCodeTool = tool(
   },
 );
 
-const searchMemoryTool = tool(
-  async ({ query }) => {
-    return await searchMemory(query);
-  },
+const searchMemoryTool = tool(async ({ query }) => await searchMemory(query), {
+  name: "search_memory",
+  description:
+    "Searches the vector database for past successful code snippets.",
+  schema: z.object({ query: z.string() }),
+});
+
+const mapArchitectureTool = tool(
+  async ({ sourceFile, targetFile }) =>
+    await mapDependency(sourceFile, targetFile),
   {
-    name: "search_memory",
+    name: "map_architecture",
+    description: "Records a dependency between two files.",
+    schema: z.object({ sourceFile: z.string(), targetFile: z.string() }),
+  },
+);
+
+const analyzeImpactTool = tool(
+  async ({ fileName }) => await analyzeImpact(fileName),
+  {
+    name: "analyze_impact",
     description:
-      "Searches the vector database for past successful code snippets.",
-    schema: z.object({
-      query: z.string(),
-    }),
+      "Checks what other files rely on a specific file before modifying it.",
+    schema: z.object({ fileName: z.string() }),
   },
 );
 
@@ -105,19 +115,24 @@ const searchMemoryTool = tool(
 // 3. Initialize LLM & Custom Nodes
 // ---------------------------------------------------------------------------
 
-const llm = new ChatOllama({
-  model: "qwen2.5-coder:7b",
-  temperature: 0,
-});
-const tools = [executeCodeTool, searchMemoryTool];
+const llm = new ChatOllama({ model: "qwen2.5-coder:7b", temperature: 0 });
+const tools = [
+  executeCodeTool,
+  searchMemoryTool,
+  mapArchitectureTool,
+  analyzeImpactTool,
+];
 const llmWithTools = llm.bindTools(tools);
 
 async function callModel(state: typeof AgentState.State) {
   let currentMessages = [...state.messages];
-  if (state.executedTools.includes("execute_code")) {
+
+  // THE FIX: Dynamically tell the model about ALL tools it just ran so it stops asking
+  if (state.executedTools.length > 0) {
+    const executedList = state.executedTools.join(", ");
     currentMessages.push(
       new SystemMessage(
-        "SYSTEM NOTICE: The code has already executed successfully. Do not call execute_code again. Analyze the execution output present in the logs and provide your final response to the user.",
+        `SYSTEM NOTICE: You have already successfully executed the following tools: [${executedList}]. Do NOT call them again. Look at the tool output in the chat history and proceed to the next step, or provide your final response.`,
       ),
     );
   }
@@ -126,43 +141,50 @@ async function callModel(state: typeof AgentState.State) {
   return { messages: [response] };
 }
 
-// BULLETPROOF ROUTER: Catches both native and text JSON calls
+// THE FIX: Universal Bulletproof Router
 function shouldContinue(state: typeof AgentState.State) {
   const lastMessage = state.messages[state.messages.length - 1];
   const content = lastMessage.content as string;
 
-  // Check Native
+  // Native API Guard
   if (
     "tool_calls" in lastMessage &&
     Array.isArray(lastMessage.tool_calls) &&
     lastMessage.tool_calls.length > 0
   ) {
     const nextTool = lastMessage.tool_calls[0].name;
-    if (
-      nextTool === "execute_code" &&
-      state.executedTools.includes("execute_code")
-    )
+    if (state.executedTools.includes(nextTool)) {
+      console.log(
+        `\n[SYSTEM GUARD] Intercepted duplicate loop for '${nextTool}'. Forcing exit.`,
+      );
       return "__end__";
+    }
     return "tools";
   }
 
-  // Check Fallback Text JSON
-  if (
-    content &&
-    (content.includes('"search_memory"') || content.includes('"execute_code"'))
-  ) {
-    if (
-      content.includes('"execute_code"') &&
-      state.executedTools.includes("execute_code")
-    )
-      return "__end__";
-    return "tools";
+  // Fallback Text Parser Guard
+  const fallbackTools = [
+    "execute_code",
+    "search_memory",
+    "map_architecture",
+    "analyze_impact",
+  ];
+  for (const tool of fallbackTools) {
+    if (content && content.includes(`"${tool}"`)) {
+      if (state.executedTools.includes(tool)) {
+        console.log(
+          `\n[SYSTEM GUARD] Intercepted duplicate fallback loop for '${tool}'. Forcing exit.`,
+        );
+        return "__end__";
+      }
+      return "tools";
+    }
   }
 
   return "__end__";
 }
 
-// BULLETPROOF EXECUTOR: Parses both native and text JSON calls
+// BULLETPROOF EXECUTOR
 async function customToolNode(state: typeof AgentState.State) {
   const lastMessage = state.messages[state.messages.length - 1];
   const content = lastMessage.content as string;
@@ -183,6 +205,10 @@ async function customToolNode(state: typeof AgentState.State) {
         result = await executeCodeTool.invoke(toolCall.args);
       else if (toolCall.name === "search_memory")
         result = await searchMemoryTool.invoke(toolCall.args);
+      else if (toolCall.name === "map_architecture")
+        result = await mapArchitectureTool.invoke(toolCall.args);
+      else if (toolCall.name === "analyze_impact")
+        result = await analyzeImpactTool.invoke(toolCall.args);
 
       toolMessages.push(
         new ToolMessage({
@@ -211,6 +237,10 @@ async function customToolNode(state: typeof AgentState.State) {
       result = await executeCodeTool.invoke(args);
     else if (toolName === "search_memory")
       result = await searchMemoryTool.invoke(args);
+    else if (toolName === "map_architecture")
+      result = await mapArchitectureTool.invoke(args);
+    else if (toolName === "analyze_impact")
+      result = await analyzeImpactTool.invoke(args);
     else result = "Unknown tool requested.";
 
     return {
@@ -249,7 +279,7 @@ async function runAgent() {
   console.log("Agent is thinking...\n");
 
   const systemInstruction = new SystemMessage(
-    "You are an advanced AI assistant. First, call `search_memory` to check for past snippets. Then, write a python script that calculates the Fibonacci sequence up to 10 and run it using `execute_code`.",
+    "You are an elite architectural AI. First, use `map_architecture` to record that 'UserAuth.ts' depends on 'DatabaseConnection.ts'. Then, use `analyze_impact` to check what happens if we decide to rewrite 'DatabaseConnection.ts'.",
   );
 
   const finalState = await app.invoke({
