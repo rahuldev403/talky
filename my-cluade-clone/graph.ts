@@ -1,10 +1,7 @@
 import neo4j from "neo4j-driver";
 
 // Connect to the Neo4j container running on port 7687
-const driver = neo4j.driver(
-  "bolt://localhost:7687",
-  neo4j.auth.basic("neo4j", "securepassword"),
-);
+const driver = neo4j.driver("bolt://localhost:7687");
 
 /**
  * Maps a structural dependency between two files in the project.
