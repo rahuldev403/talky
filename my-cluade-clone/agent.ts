@@ -16,12 +16,37 @@ import * as fs from "fs";
 import * as path from "path";
 import { exec } from "child_process";
 import { promisify } from "util";
+import * as readline from "readline";
+import postgres from "postgres"; // <-- Make sure to run `npm install postgres`
+
 import { saveToMemory, searchMemory } from "./memory";
 import { mapDependency, analyzeImpact } from "./graph";
 
 const execAsync = promisify(exec);
 
+// ============================================================================
+// UI: Terminal Progress Spinner
+// ============================================================================
+let spinnerInterval: NodeJS.Timeout;
+function startSpinner(message: string) {
+  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  let i = 0;
+  process.stdout.write("\x1B[?25l"); // Hide cursor
+  spinnerInterval = setInterval(() => {
+    process.stdout.write(`\r\x1b[36m${frames[i]} ${message}\x1b[0m`);
+    i = (i + 1) % frames.length;
+  }, 80);
+}
+function stopSpinner(successMessage?: string) {
+  clearInterval(spinnerInterval);
+  process.stdout.write("\r\x1b[K"); // Clear the line
+  process.stdout.write("\x1B[?25h"); // Show cursor
+  if (successMessage) console.log(`\x1b[32m✓ ${successMessage}\x1b[0m`);
+}
+
+// ============================================================================
 // 1. State Definition
+// ============================================================================
 const AgentState = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
     reducer: messagesStateReducer,
@@ -33,13 +58,78 @@ const AgentState = Annotation.Root({
   }),
 });
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // 2. Define Tools
-// ---------------------------------------------------------------------------
+// ============================================================================
+
+// NEW: SQL Execution Tool
+const executeSqlTool = tool(
+  async ({ query }) => {
+    stopSpinner();
+    startSpinner(`Executing SQL query...`);
+    // Connects directly to the Docker PostgreSQL container you built
+    const sql = postgres(
+      "postgres://admin:securepassword@localhost:5432/claudedb",
+      { prepare: false },
+    );
+    try {
+      const result = await sql.unsafe(query);
+      return `Query executed successfully. Result:\n${JSON.stringify(result, null, 2)}`;
+    } catch (error: any) {
+      return `SQL Error: ${error.message}`;
+    } finally {
+      await sql.end();
+    }
+  },
+  {
+    name: "execute_sql",
+    description:
+      "Executes raw SQL queries against the local PostgreSQL database.",
+    schema: z.object({ query: z.string() }),
+  },
+);
+
+const writeFileTool = tool(
+  async ({ filePath, content }) => {
+    stopSpinner();
+    startSpinner(`Writing file: ${filePath}...`);
+    try {
+      const dir = path.dirname(filePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(filePath, content);
+      return `Successfully wrote to ${filePath}`;
+    } catch (error: any) {
+      return `Failed to write file: ${error.message}`;
+    }
+  },
+  {
+    name: "write_file",
+    description: "Creates or overwrites a file on the local machine.",
+    schema: z.object({ filePath: z.string(), content: z.string() }),
+  },
+);
+
+const readFileTool = tool(
+  async ({ filePath }) => {
+    stopSpinner();
+    startSpinner(`Reading file: ${filePath}...`);
+    try {
+      return fs.readFileSync(filePath, "utf-8");
+    } catch (error: any) {
+      return `Failed to read file: ${error.message}`;
+    }
+  },
+  {
+    name: "read_file",
+    description: "Reads a file from the local machine.",
+    schema: z.object({ filePath: z.string() }),
+  },
+);
 
 const executeCodeTool = tool(
-  async ({ code, language, objective }) => {
-    console.log(`\n[SYSTEM] Spinning up Docker to run ${language} code...`);
+  async ({ code, language }) => {
+    stopSpinner();
+    startSpinner(`Testing ${language} in Docker...`);
     const tmpDir = path.join(process.cwd(), "tmp_sandbox");
     if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
 
@@ -65,7 +155,7 @@ const executeCodeTool = tool(
         `docker run --rm --network none -v "${tmpDir}:/app" -w /app ${dockerImage} ${runCmd}`,
         { timeout: 10000 },
       );
-      await saveToMemory(code, language, objective || "Execution test");
+      await saveToMemory(code, language, "Execution test");
       return `Execution Output:\n${stdout}\n${stderr ? "Warnings:\n" + stderr : ""}`;
     } catch (error: any) {
       return `Execution Failed:\n${error.message}\n${error.stderr || ""}`;
@@ -76,24 +166,30 @@ const executeCodeTool = tool(
   {
     name: "execute_code",
     description: "Executes code inside the secure Docker sandbox.",
-    schema: z.object({
-      code: z.string(),
-      language: z.string(),
-      objective: z.string().optional(),
-    }),
+    schema: z.object({ code: z.string(), language: z.string() }),
   },
 );
 
-const searchMemoryTool = tool(async ({ query }) => await searchMemory(query), {
-  name: "search_memory",
-  description:
-    "Searches the vector database for past successful code snippets.",
-  schema: z.object({ query: z.string() }),
-});
+const searchMemoryTool = tool(
+  async ({ query }) => {
+    stopSpinner();
+    startSpinner(`Searching Vector DB...`);
+    return await searchMemory(query);
+  },
+  {
+    name: "search_memory",
+    description:
+      "Searches the vector database for past successful code snippets.",
+    schema: z.object({ query: z.string() }),
+  },
+);
 
 const mapArchitectureTool = tool(
-  async ({ sourceFile, targetFile }) =>
-    await mapDependency(sourceFile, targetFile),
+  async ({ sourceFile, targetFile }) => {
+    stopSpinner();
+    startSpinner(`Graphing dependency...`);
+    return await mapDependency(sourceFile, targetFile);
+  },
   {
     name: "map_architecture",
     description: "Records a dependency between two files.",
@@ -102,18 +198,21 @@ const mapArchitectureTool = tool(
 );
 
 const analyzeImpactTool = tool(
-  async ({ fileName }) => await analyzeImpact(fileName),
+  async ({ fileName }) => {
+    stopSpinner();
+    startSpinner(`Analyzing graph impact...`);
+    return await analyzeImpact(fileName);
+  },
   {
     name: "analyze_impact",
-    description:
-      "Checks what other files rely on a specific file before modifying it.",
+    description: "Checks what other files rely on a specific file.",
     schema: z.object({ fileName: z.string() }),
   },
 );
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // 3. Initialize LLM & Custom Nodes
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 const llm = new ChatOllama({ model: "qwen2.5-coder:7b", temperature: 0 });
 const tools = [
@@ -121,18 +220,22 @@ const tools = [
   searchMemoryTool,
   mapArchitectureTool,
   analyzeImpactTool,
+  writeFileTool,
+  readFileTool,
+  executeSqlTool,
 ];
 const llmWithTools = llm.bindTools(tools);
 
 async function callModel(state: typeof AgentState.State) {
+  stopSpinner();
+  startSpinner("Agent is thinking...");
   let currentMessages = [...state.messages];
 
-  // THE FIX: Dynamically tell the model about ALL tools it just ran so it stops asking
   if (state.executedTools.length > 0) {
     const executedList = state.executedTools.join(", ");
     currentMessages.push(
       new SystemMessage(
-        `SYSTEM NOTICE: You have already successfully executed the following tools: [${executedList}]. Do NOT call them again. Look at the tool output in the chat history and proceed to the next step, or provide your final response.`,
+        `SYSTEM NOTICE: You successfully executed: [${executedList}]. Look at the tool output and proceed to the next step, or summarize.`,
       ),
     );
   }
@@ -141,130 +244,105 @@ async function callModel(state: typeof AgentState.State) {
   return { messages: [response] };
 }
 
-// THE FIX: Universal Bulletproof Router
 function shouldContinue(state: typeof AgentState.State) {
   const lastMessage = state.messages[state.messages.length - 1];
   const content = lastMessage.content as string;
 
-  // Native API Guard
   if (
     "tool_calls" in lastMessage &&
     Array.isArray(lastMessage.tool_calls) &&
     lastMessage.tool_calls.length > 0
   ) {
     const nextTool = lastMessage.tool_calls[0].name;
-    if (state.executedTools.includes(nextTool)) {
-      console.log(
-        `\n[SYSTEM GUARD] Intercepted duplicate loop for '${nextTool}'. Forcing exit.`,
-      );
-      return "__end__";
-    }
+    if (state.executedTools.includes(nextTool)) return "__end__";
     return "tools";
   }
 
-  // Fallback Text Parser Guard
   const fallbackTools = [
     "execute_code",
     "search_memory",
     "map_architecture",
     "analyze_impact",
+    "write_file",
+    "read_file",
+    "execute_sql",
   ];
-  for (const tool of fallbackTools) {
-    if (content && content.includes(`"${tool}"`)) {
-      if (state.executedTools.includes(tool)) {
-        console.log(
-          `\n[SYSTEM GUARD] Intercepted duplicate fallback loop for '${tool}'. Forcing exit.`,
-        );
-        return "__end__";
-      }
+  for (const t of fallbackTools) {
+    if (content && content.includes(`"${t}"`)) {
+      if (state.executedTools.includes(t)) return "__end__";
       return "tools";
     }
   }
-
   return "__end__";
 }
 
-// BULLETPROOF EXECUTOR
 async function customToolNode(state: typeof AgentState.State) {
   const lastMessage = state.messages[state.messages.length - 1];
   const content = lastMessage.content as string;
   const toolMessages: ToolMessage[] = [];
   const newlyExecuted: string[] = [];
 
-  // Case A: Native tool calls
+  // Combine Native and Fallback logic to process the tool request
+  let toolCallsToProcess = [];
   if (
     "tool_calls" in lastMessage &&
     Array.isArray(lastMessage.tool_calls) &&
     lastMessage.tool_calls.length > 0
   ) {
-    for (const toolCall of lastMessage.tool_calls) {
-      let result = "";
-      newlyExecuted.push(toolCall.name);
-
-      if (toolCall.name === "execute_code")
-        result = await executeCodeTool.invoke(toolCall.args);
-      else if (toolCall.name === "search_memory")
-        result = await searchMemoryTool.invoke(toolCall.args);
-      else if (toolCall.name === "map_architecture")
-        result = await mapArchitectureTool.invoke(toolCall.args);
-      else if (toolCall.name === "analyze_impact")
-        result = await analyzeImpactTool.invoke(toolCall.args);
-
-      toolMessages.push(
-        new ToolMessage({
-          content: result,
-          tool_call_id: toolCall.id ?? "manual_id",
-        }),
+    toolCallsToProcess = lastMessage.tool_calls;
+  } else {
+    try {
+      const cleanJson = content.substring(
+        content.indexOf("{"),
+        content.lastIndexOf("}") + 1,
       );
+      const parsed = JSON.parse(cleanJson);
+      toolCallsToProcess = [
+        {
+          name: parsed.name || parsed.action,
+          args: parsed.arguments || parsed.args || parsed,
+          id: "manual_id",
+        },
+      ];
+    } catch (e) {
+      /* Ignore text failures */
     }
-    return { messages: toolMessages, executedTools: newlyExecuted };
   }
 
-  // Case B: Fallback Text JSON Parsing
-  try {
-    const cleanJson = content.substring(
-      content.indexOf("{"),
-      content.lastIndexOf("}") + 1,
-    );
-    const parsed = JSON.parse(cleanJson);
-    const toolName = parsed.name || parsed.action;
-    const args = parsed.arguments || parsed.args || parsed;
-
+  for (const toolCall of toolCallsToProcess) {
     let result = "";
-    newlyExecuted.push(toolName);
+    newlyExecuted.push(toolCall.name);
+    if (toolCall.name === "execute_code")
+      result = await executeCodeTool.invoke(toolCall.args);
+    else if (toolCall.name === "search_memory")
+      result = await searchMemoryTool.invoke(toolCall.args);
+    else if (toolCall.name === "map_architecture")
+      result = await mapArchitectureTool.invoke(toolCall.args);
+    else if (toolCall.name === "analyze_impact")
+      result = await analyzeImpactTool.invoke(toolCall.args);
+    else if (toolCall.name === "write_file")
+      result = await writeFileTool.invoke(toolCall.args);
+    else if (toolCall.name === "read_file")
+      result = await readFileTool.invoke(toolCall.args);
+    else if (toolCall.name === "execute_sql")
+      result = await executeSqlTool.invoke(toolCall.args);
 
-    if (toolName === "execute_code")
-      result = await executeCodeTool.invoke(args);
-    else if (toolName === "search_memory")
-      result = await searchMemoryTool.invoke(args);
-    else if (toolName === "map_architecture")
-      result = await mapArchitectureTool.invoke(args);
-    else if (toolName === "analyze_impact")
-      result = await analyzeImpactTool.invoke(args);
-    else result = "Unknown tool requested.";
-
-    return {
-      messages: [
-        new ToolMessage({ content: result, tool_call_id: "manual_id" }),
-      ],
-      executedTools: newlyExecuted,
-    };
-  } catch (err) {
-    return {
-      messages: [
-        new ToolMessage({
-          content: "Error parsing tool parameters from text.",
-          tool_call_id: "manual_id",
-        }),
-      ],
-      executedTools: [],
-    };
+    toolMessages.push(
+      new ToolMessage({ content: result, tool_call_id: toolCall.id }),
+    );
   }
+  return {
+    messages:
+      toolMessages.length > 0
+        ? toolMessages
+        : [new ToolMessage({ content: "Error", tool_call_id: "manual_id" })],
+    executedTools: newlyExecuted,
+  };
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // 4. Build Graph
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 const workflow = new StateGraph(AgentState)
   .addNode("agent", callModel)
@@ -275,20 +353,66 @@ const workflow = new StateGraph(AgentState)
 
 const app = workflow.compile();
 
-async function runAgent() {
-  console.log("Agent is thinking...\n");
+// ============================================================================
+// 5. Interactive CLI
+// ============================================================================
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
 
-  const systemInstruction = new SystemMessage(
-    "You are an elite architectural AI. First, use `map_architecture` to record that 'UserAuth.ts' depends on 'DatabaseConnection.ts'. Then, use `analyze_impact` to check what happens if we decide to rewrite 'DatabaseConnection.ts'.",
+// THE MASTER PROMPT: Forces the agent to act instead of talk.
+const MASTER_INSTRUCTION = new SystemMessage(
+  `You are an elite autonomous AI developer. 
+    CRITICAL RULES:
+    1. NEVER output raw code blocks. You MUST use the 'write_file' tool to scaffold code onto the local machine.
+    2. If asked to run or test something, MUST use the 'execute_code' tool (Docker sandbox).
+    3. If asked to check the database, use 'execute_sql'.
+    DO NOT explain what you are going to do. Just use the tools and do it.`,
+);
+
+async function runInteractiveCLI() {
+  console.clear();
+  console.log(
+    "\x1b[36m==================================================\x1b[0m",
+  );
+  console.log(
+    "\x1b[1m🤖 Terminal Agent Initialized (Type 'exit' to quit)\x1b[0m",
+  );
+  console.log(
+    "\x1b[36m==================================================\x1b[0m\n",
   );
 
-  const finalState = await app.invoke({
-    messages: [systemInstruction],
-    executedTools: [],
-  });
+  let currentConfig = { configurable: { thread_id: "1" } };
+  let currentState = { messages: [MASTER_INSTRUCTION], executedTools: [] };
 
-  const lastMessage = finalState.messages[finalState.messages.length - 1];
-  console.log("\n[AGENT RESPONSE]:\n" + lastMessage.content);
+  const askQuestion = () => {
+    rl.question("\x1b[32m❯ You: \x1b[0m", async (userInput) => {
+      if (userInput.toLowerCase() === "exit") {
+        stopSpinner();
+        rl.close();
+        process.exit(0);
+      }
+
+      currentState.messages.push(new HumanMessage(userInput));
+      currentState.executedTools = [];
+
+      try {
+        const finalState = await app.invoke(currentState, currentConfig);
+        stopSpinner();
+        currentState = finalState;
+        const lastMessage = finalState.messages[finalState.messages.length - 1];
+        console.log(
+          `\n\x1b[1m🤖 Claude Clone:\x1b[0m\n${lastMessage.content}\n`,
+        );
+      } catch (error) {
+        stopSpinner();
+        console.error("\n[SYSTEM ERROR] Graph execution failed:", error);
+      }
+      askQuestion();
+    });
+  };
+  askQuestion();
 }
 
-runAgent();
+runInteractiveCLI();
