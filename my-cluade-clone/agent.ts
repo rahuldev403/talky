@@ -30,6 +30,9 @@ const execAsync = promisify(exec);
 let spinnerInterval: NodeJS.Timeout;
 let currentStepNumber = 0;
 let executionPlan: string[] = [];
+const MAX_STEP_MS = 60_000;
+const MAX_RUN_MS = 10 * 60_000;
+let runStartedAt = 0;
 
 function initializePlan(steps: string[]) {
   executionPlan = steps;
@@ -45,14 +48,28 @@ function advanceToStep(stepIndex: number, detailMessage: string) {
   stopSpinner();
   currentStepNumber = stepIndex;
 
-  console.log(`\x1b[32m✔ Step ${stepIndex}: Completed previous phase.\x1b[0m`);
+  if (stepIndex > 0) {
+    console.log(`\x1b[32m✔ Step ${stepIndex}: Completed.\x1b[0m`);
+  }
   if (executionPlan[stepIndex]) {
     console.log(
-      `\x1b[34m🚀 Moving to Step ${stepIndex + 1}: ${executionPlan[stepIndex]}\x1b[0m`,
+      `\x1b[34m🚀 Step ${stepIndex + 1}: ${executionPlan[stepIndex]}\x1b[0m`,
     );
   }
 
   startSpinner(detailMessage);
+}
+
+function extractPlanSteps(text: string): string[] {
+  if (!text) return [];
+  const lines = text.split(/\r?\n/);
+  const steps = lines
+    .map((line) => {
+      const match = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      return match ? match[1].trim() : "";
+    })
+    .filter((step) => step.length > 0);
+  return steps;
 }
 
 function startSpinner(message: string) {
@@ -264,6 +281,11 @@ async function callModel(state: typeof AgentState.State) {
   }
 
   const response = await llmWithTools.invoke(currentMessages);
+  if (executionPlan.length === 0) {
+    const responseText = response.content as string;
+    const planSteps = extractPlanSteps(responseText || "");
+    if (planSteps.length > 0) initializePlan(planSteps);
+  }
   return { messages: [response] };
 }
 
@@ -277,7 +299,6 @@ function shouldContinue(state: typeof AgentState.State) {
     lastMessage.tool_calls.length > 0
   ) {
     const nextTool = lastMessage.tool_calls[0].name;
-    if (state.executedTools.includes(nextTool)) return "__end__";
     return "tools";
   }
 
@@ -291,10 +312,7 @@ function shouldContinue(state: typeof AgentState.State) {
     "execute_sql",
   ];
   for (const t of fallbackTools) {
-    if (content && content.includes(`"${t}"`)) {
-      if (state.executedTools.includes(t)) return "__end__";
-      return "tools";
-    }
+    if (content && content.includes(`"${t}"`)) return "tools";
   }
   return "__end__";
 }
@@ -337,33 +355,72 @@ async function customToolNode(state: typeof AgentState.State) {
     let result = "";
     newlyExecuted.push(toolCall.name);
 
+    if (runStartedAt > 0 && Date.now() - runStartedAt > MAX_RUN_MS) {
+      stopSpinner();
+      result = "Execution stopped: overall time limit reached.";
+      toolMessages.push(
+        new ToolMessage({
+          content: result,
+          tool_call_id: toolCall.id || "manual_id",
+        }),
+      );
+      return { messages: toolMessages, executedTools: newlyExecuted };
+    }
+
+    if (executionPlan.length > 0 && currentStepNumber < executionPlan.length) {
+      advanceToStep(currentStepNumber, `Executing ${toolCall.name}...`);
+      currentStepNumber += 1;
+    }
+
     if (toolCall.name === "write_file") {
       const targetFile = toolCall.args.filePath;
-      currentStepNumber++;
       stopSpinner();
       console.log(
         `\x1b[33m⚡ [BUILDING] Writing file system asset: ${targetFile}\x1b[0m`,
       );
       startSpinner(`Writing contents to ${targetFile}...`);
-      result = await writeFileTool.invoke(toolCall.args);
+      result = await Promise.race([
+        writeFileTool.invoke(toolCall.args),
+        new Promise<string>((resolve) =>
+          setTimeout(() => resolve("Write timed out after 60s."), MAX_STEP_MS),
+        ),
+      ]);
     } else if (toolCall.name === "execute_code") {
       stopSpinner();
       console.log(
         `\x1b[33m⚡ [SANDBOX] Running code verification loop...\x1b[0m`,
       );
       startSpinner(`Testing environment inside isolated Docker container...`);
-      result = await executeCodeTool.invoke(toolCall.args);
+      result = await Promise.race([
+        executeCodeTool.invoke(toolCall.args),
+        new Promise<string>((resolve) =>
+          setTimeout(
+            () => resolve("Execution timed out after 60s."),
+            MAX_STEP_MS,
+          ),
+        ),
+      ]);
     } else if (toolCall.name === "execute_sql") {
       stopSpinner();
       console.log(
         `\x1b[33m⚡ [DATABASE] Modifying local database schemas...\x1b[0m`,
       );
       startSpinner(`Running query against claudedb...`);
-      result = await executeSqlTool.invoke(toolCall.args);
+      result = await Promise.race([
+        executeSqlTool.invoke(toolCall.args),
+        new Promise<string>((resolve) =>
+          setTimeout(() => resolve("SQL timed out after 60s."), MAX_STEP_MS),
+        ),
+      ]);
     } else {
       const matchedTool = tools.find((t) => t.name === toolCall.name);
       if (matchedTool) {
-        result = await matchedTool.invoke(toolCall.args);
+        result = await Promise.race([
+          matchedTool.invoke(toolCall.args),
+          new Promise<string>((resolve) =>
+            setTimeout(() => resolve("Tool timed out after 60s."), MAX_STEP_MS),
+          ),
+        ]);
       } else {
         result = "Unknown tool requested.";
       }
@@ -450,6 +507,7 @@ async function runInteractiveCLI() {
 
   let currentConfig = { configurable: { thread_id: "1" } };
   let currentState = { messages: [MASTER_INSTRUCTION], executedTools: [] };
+  runStartedAt = Date.now();
 
   const askQuestion = () => {
     rl.question("\x1b[32m❯ You: \x1b[0m", async (userInput) => {
