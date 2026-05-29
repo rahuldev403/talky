@@ -17,31 +17,62 @@ import * as path from "path";
 import { exec } from "child_process";
 import { promisify } from "util";
 import * as readline from "readline";
-import postgres from "postgres"; // <-- Make sure to run `npm install postgres`
 
 import { saveToMemory, searchMemory } from "./memory";
 import { mapDependency, analyzeImpact } from "./graph";
+import { sql, verifyDatabaseConnection } from "./db";
 
 const execAsync = promisify(exec);
 
 // ============================================================================
-// UI: Terminal Progress Spinner
+// UI: Enhanced Step Tracker & Spinner
 // ============================================================================
 let spinnerInterval: NodeJS.Timeout;
+let currentStepNumber = 0;
+let executionPlan: string[] = [];
+
+function initializePlan(steps: string[]) {
+  executionPlan = steps;
+  currentStepNumber = 0;
+  console.log(`\n\x1b[35m📋 SYSTEM EXECUTION ROADMAP:\x1b[0m`);
+  steps.forEach((step, index) => {
+    console.log(`  \x1b[90m${index + 1}. [ ] ${step}\x1b[0m`);
+  });
+  console.log("");
+}
+
+function advanceToStep(stepIndex: number, detailMessage: string) {
+  stopSpinner();
+  currentStepNumber = stepIndex;
+
+  console.log(`\x1b[32m✔ Step ${stepIndex}: Completed previous phase.\x1b[0m`);
+  if (executionPlan[stepIndex]) {
+    console.log(
+      `\x1b[34m🚀 Moving to Step ${stepIndex + 1}: ${executionPlan[stepIndex]}\x1b[0m`,
+    );
+  }
+
+  startSpinner(detailMessage);
+}
+
 function startSpinner(message: string) {
   const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
   let i = 0;
   process.stdout.write("\x1B[?25l"); // Hide cursor
   spinnerInterval = setInterval(() => {
-    process.stdout.write(`\r\x1b[36m${frames[i]} ${message}\x1b[0m`);
+    process.stdout.write(
+      `\r\x1b[36m${frames[i]} [Step ${currentStepNumber + 1}] ${message}\x1b[0m`,
+    );
     i = (i + 1) % frames.length;
   }, 80);
 }
+
 function stopSpinner(successMessage?: string) {
+  if (!spinnerInterval) return;
   clearInterval(spinnerInterval);
-  process.stdout.write("\r\x1b[K"); // Clear the line
+  process.stdout.write("\r\x1b[K"); // Clear line
   process.stdout.write("\x1B[?25h"); // Show cursor
-  if (successMessage) console.log(`\x1b[32m✓ ${successMessage}\x1b[0m`);
+  if (successMessage) console.log(`\x1b[32m✔ ${successMessage}\x1b[0m`);
 }
 
 // ============================================================================
@@ -61,33 +92,6 @@ const AgentState = Annotation.Root({
 // ============================================================================
 // 2. Define Tools
 // ============================================================================
-
-// NEW: SQL Execution Tool
-const executeSqlTool = tool(
-  async ({ query }) => {
-    stopSpinner();
-    startSpinner(`Executing SQL query...`);
-    // Connects directly to the Docker PostgreSQL container you built
-    const sql = postgres(
-      "postgres://admin:securepassword@localhost:5432/claudedb",
-      { prepare: false },
-    );
-    try {
-      const result = await sql.unsafe(query);
-      return `Query executed successfully. Result:\n${JSON.stringify(result, null, 2)}`;
-    } catch (error: any) {
-      return `SQL Error: ${error.message}`;
-    } finally {
-      await sql.end();
-    }
-  },
-  {
-    name: "execute_sql",
-    description:
-      "Executes raw SQL queries against the local PostgreSQL database.",
-    schema: z.object({ query: z.string() }),
-  },
-);
 
 const writeFileTool = tool(
   async ({ filePath, content }) => {
@@ -210,6 +214,25 @@ const analyzeImpactTool = tool(
   },
 );
 
+const executeSqlTool = tool(
+  async ({ query }) => {
+    stopSpinner();
+    startSpinner(`Executing SQL query...`);
+    try {
+      const result = await sql.unsafe(query);
+      return `Query executed successfully. Result:\n${JSON.stringify(result, null, 2)}`;
+    } catch (error: any) {
+      return `SQL Error: ${error.message}`;
+    }
+  },
+  {
+    name: "execute_sql",
+    description:
+      "Executes raw SQL queries against the local PostgreSQL database.",
+    schema: z.object({ query: z.string() }),
+  },
+);
+
 // ============================================================================
 // 3. Initialize LLM & Custom Nodes
 // ============================================================================
@@ -276,14 +299,15 @@ function shouldContinue(state: typeof AgentState.State) {
   return "__end__";
 }
 
+// Merged customToolNode containing both fallback parsing and dynamic UI steps
 async function customToolNode(state: typeof AgentState.State) {
   const lastMessage = state.messages[state.messages.length - 1];
   const content = lastMessage.content as string;
   const toolMessages: ToolMessage[] = [];
   const newlyExecuted: string[] = [];
 
-  // Combine Native and Fallback logic to process the tool request
   let toolCallsToProcess = [];
+
   if (
     "tool_calls" in lastMessage &&
     Array.isArray(lastMessage.tool_calls) &&
@@ -312,30 +336,57 @@ async function customToolNode(state: typeof AgentState.State) {
   for (const toolCall of toolCallsToProcess) {
     let result = "";
     newlyExecuted.push(toolCall.name);
-    if (toolCall.name === "execute_code")
-      result = await executeCodeTool.invoke(toolCall.args);
-    else if (toolCall.name === "search_memory")
-      result = await searchMemoryTool.invoke(toolCall.args);
-    else if (toolCall.name === "map_architecture")
-      result = await mapArchitectureTool.invoke(toolCall.args);
-    else if (toolCall.name === "analyze_impact")
-      result = await analyzeImpactTool.invoke(toolCall.args);
-    else if (toolCall.name === "write_file")
+
+    if (toolCall.name === "write_file") {
+      const targetFile = toolCall.args.filePath;
+      currentStepNumber++;
+      stopSpinner();
+      console.log(
+        `\x1b[33m⚡ [BUILDING] Writing file system asset: ${targetFile}\x1b[0m`,
+      );
+      startSpinner(`Writing contents to ${targetFile}...`);
       result = await writeFileTool.invoke(toolCall.args);
-    else if (toolCall.name === "read_file")
-      result = await readFileTool.invoke(toolCall.args);
-    else if (toolCall.name === "execute_sql")
+    } else if (toolCall.name === "execute_code") {
+      stopSpinner();
+      console.log(
+        `\x1b[33m⚡ [SANDBOX] Running code verification loop...\x1b[0m`,
+      );
+      startSpinner(`Testing environment inside isolated Docker container...`);
+      result = await executeCodeTool.invoke(toolCall.args);
+    } else if (toolCall.name === "execute_sql") {
+      stopSpinner();
+      console.log(
+        `\x1b[33m⚡ [DATABASE] Modifying local database schemas...\x1b[0m`,
+      );
+      startSpinner(`Running query against claudedb...`);
       result = await executeSqlTool.invoke(toolCall.args);
+    } else {
+      const matchedTool = tools.find((t) => t.name === toolCall.name);
+      if (matchedTool) {
+        result = await matchedTool.invoke(toolCall.args);
+      } else {
+        result = "Unknown tool requested.";
+      }
+    }
 
     toolMessages.push(
-      new ToolMessage({ content: result, tool_call_id: toolCall.id }),
+      new ToolMessage({
+        content: result,
+        tool_call_id: toolCall.id || "manual_id",
+      }),
     );
   }
+
   return {
     messages:
       toolMessages.length > 0
         ? toolMessages
-        : [new ToolMessage({ content: "Error", tool_call_id: "manual_id" })],
+        : [
+            new ToolMessage({
+              content: "Error parsing tools",
+              tool_call_id: "manual_id",
+            }),
+          ],
     executedTools: newlyExecuted,
   };
 }
@@ -356,19 +407,19 @@ const app = workflow.compile();
 // ============================================================================
 // 5. Interactive CLI
 // ============================================================================
+
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
 });
 
-// THE MASTER PROMPT: Forces the agent to act instead of talk.
 const MASTER_INSTRUCTION = new SystemMessage(
   `You are an elite autonomous AI developer. 
-    CRITICAL RULES:
-    1. NEVER output raw code blocks. You MUST use the 'write_file' tool to scaffold code onto the local machine.
-    2. If asked to run or test something, MUST use the 'execute_code' tool (Docker sandbox).
-    3. If asked to check the database, use 'execute_sql'.
-    DO NOT explain what you are going to do. Just use the tools and do it.`,
+    CRITICAL WORKFLOW RULES:
+    1. When handled a massive task (like building an app), your first response should outline the files you intend to make.
+    2. You MUST use the 'write_file' tool to write out the physical files onto the machine. Do not just print them in text.
+    3. You MUST use 'execute_code' to run docker instances (e.g., pulling and spinning up MongoDB images).
+    4. Proceed through your work step-by-step, explaining briefly which file or component you are wiring next before invoking the tool.`,
 );
 
 async function runInteractiveCLI() {
@@ -382,6 +433,20 @@ async function runInteractiveCLI() {
   console.log(
     "\x1b[36m==================================================\x1b[0m\n",
   );
+
+  startSpinner("Verifying database connections...");
+  const isDbConnected = await verifyDatabaseConnection();
+  stopSpinner();
+
+  if (!isDbConnected) {
+    console.log(
+      "\x1b[31m⚠️ Warning: Database is offline. SQL tools will fail until Docker is running.\x1b[0m\n",
+    );
+  } else {
+    console.log(
+      "\x1b[32m✓ PostgreSQL Database connected successfully.\x1b[0m\n",
+    );
+  }
 
   let currentConfig = { configurable: { thread_id: "1" } };
   let currentState = { messages: [MASTER_INSTRUCTION], executedTools: [] };
@@ -398,7 +463,10 @@ async function runInteractiveCLI() {
       currentState.executedTools = [];
 
       try {
-        const finalState = await app.invoke(currentState, currentConfig);
+        const finalState = await app.invoke(currentState, {
+          ...currentConfig,
+          recursionLimit: 150,
+        });
         stopSpinner();
         currentState = finalState;
         const lastMessage = finalState.messages[finalState.messages.length - 1];
